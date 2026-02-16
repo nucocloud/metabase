@@ -538,4 +538,3 @@
   "Perform a transformation on the native query stage, if it exists."
   [qry f & args]
   (apply u/update-in-if-exists qry [:stages 0 :native] f args))
-
