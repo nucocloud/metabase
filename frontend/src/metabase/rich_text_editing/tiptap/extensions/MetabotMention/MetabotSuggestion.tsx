@@ -1,166 +1,224 @@
-import type { Editor, Range } from "@tiptap/core";
+import { useClickOutside } from "@mantine/hooks";
 import {
   forwardRef,
   useCallback,
-  useEffect,
   useImperativeHandle,
   useMemo,
   useState,
 } from "react";
 import { t } from "ttag";
 
-import { useListDatabasesQuery } from "metabase/api";
+import {
+  EntityPickerModal,
+  MiniPicker,
+  type OmniPickerItem,
+} from "metabase/common/components/Pickers";
+import { shouldDisableItemNotInDb } from "metabase/common/components/Pickers/DataPicker";
 import type {
-  Item,
-  Section,
-} from "metabase/common/components/AccordionList/types";
-import { searchFilter } from "metabase/common/components/AccordionList/utils";
-import type { MenuItem } from "metabase/documents/components/Editor/shared/MenuComponents";
-import { MenuItemComponent } from "metabase/documents/components/Editor/shared/MenuComponents";
-import { SuggestionPaper } from "metabase/documents/components/Editor/shared/SuggestionPaper";
-import { Box, Group, Loader, Text } from "metabase/ui";
-import type { Database, SearchResult } from "metabase-types/api";
+  MiniPickerItem,
+  MiniPickerPickableItem,
+} from "metabase/common/components/Pickers/MiniPicker/types";
+import type { DatabaseId } from "metabase-types/api";
 
-import { buildDbMenuItems } from "../shared/suggestionUtils";
+import { ExternalMenuTarget } from "../shared/ExternalMenuTarget";
+import type { SuggestionModel } from "../shared/types";
+import type { EntitySearchOptions } from "../shared/useEntitySearch";
+import type {
+  BareSuggestionRendererProps,
+  BareSuggestionRendererRef,
+} from "../suggestionRenderer";
 
-interface MentionSuggestionProps {
-  items: SearchResult[];
-  command: (item: MentionCommandItem) => void;
-  editor: Editor;
-  range: Range;
-  query: string;
+import type { MentionProps } from "./MetabotMentionExtension";
+
+interface MetabotMentionSuggestionPropsBase {
+  searchModels?: SuggestionModel[];
+  searchOptions?: EntitySearchOptions;
+  onlyDatabaseId?: DatabaseId;
+  isCompact?: boolean;
 }
-
-interface MentionCommandItem {
-  type?: string;
-  id?: number | string;
-  model?: string;
-}
-
-interface SuggestionRef {
-  onKeyDown: (props: { event: KeyboardEvent }) => boolean;
-}
+export type MetabotMentionSuggestionProps = MetabotMentionSuggestionPropsBase &
+  BareSuggestionRendererProps<unknown, MentionProps>;
 
 const MetabotMentionSuggestionComponent = forwardRef<
-  SuggestionRef,
-  MentionSuggestionProps
->(function MetabotMentionSuggestionComponent(
-  { items: _items, command, range: _range, query },
+  BareSuggestionRendererRef,
+  MetabotMentionSuggestionProps
+>(function MentionSuggestionComponent(
+  {
+    items: _items,
+    command,
+    editor,
+    range: _range,
+    query,
+    searchModels,
+    onlyDatabaseId,
+    decorationNode,
+    onClose,
+    isCompact,
+  },
   ref,
 ) {
-  const [selectedIndex, setSelectedIndex] = useState(0);
-  const { data: dbsResponse, isLoading } = useListDatabasesQuery();
+  const [isBrowsing, setIsBrowsing] = useState(false);
 
-  const handleDbSelect = useCallback(
-    (item: Database) => {
+  const onSelectEntity = useCallback(
+    (item: OmniPickerItem) => {
       command({
         id: item.id,
-        model: "database",
+        model: item.model,
+        label: item.name,
       });
     },
     [command],
   );
 
-  const menuItems = useMemo(() => {
-    const items: MenuItem[] = [];
-
-    if (dbsResponse?.data) {
-      const sections: Section<Item & { database: Database }>[] = [];
-
-      sections.push({
-        items: dbsResponse.data.map((database, index) => ({
-          name: database.name,
-          index,
-          database,
-        })),
-      });
-
-      const sorted = searchFilter<
-        Item & { database: Database },
-        (typeof sections)[number]
-      >({
-        sections,
-        searchText: query,
-      })[0];
-      const dbs = sorted?.items?.map((item) => item.item.database) || [];
-      items.push(...buildDbMenuItems(dbs, handleDbSelect));
-    }
-
-    return items;
-  }, [dbsResponse?.data, handleDbSelect, query]);
-
-  const totalItems = menuItems.length;
-
-  const selectItem = (index: number) => {
-    menuItems[index]?.action?.();
-  };
-
-  const upHandler = () => {
-    setSelectedIndex((prev) => (prev - 1 + totalItems) % totalItems);
-  };
-
-  const downHandler = () => {
-    setSelectedIndex((prev) => (prev + 1) % totalItems);
-  };
-
-  const enterHandler = () => {
-    selectItem(selectedIndex);
-  };
-
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [menuItems.length]);
+  const [isTrappingFocus, setIsTrappingFocus] = useState(false);
 
   useImperativeHandle(ref, () => ({
     onKeyDown: ({ event }: { event: KeyboardEvent }) => {
-      if (event.key === "ArrowUp") {
-        upHandler();
+      if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        setIsTrappingFocus(true);
         return true;
       }
-
-      if (event.key === "ArrowDown") {
-        downHandler();
+      if (event.key === "Escape") {
+        onClose();
         return true;
       }
-
-      if (event.key === "Enter") {
-        enterHandler();
-        return true;
-      }
-
+      setIsTrappingFocus(false);
       return false;
     },
   }));
 
+  const searchModelsReal = searchModels?.filter(
+    (model) =>
+      model !== "database" &&
+      model !== "action" &&
+      model !== "segment" &&
+      model !== "user",
+  );
+
+  const shouldHide = useMemo(() => {
+    const shouldDisableBasedOnDb = shouldDisableItemNotInDb(onlyDatabaseId);
+
+    return (item: MiniPickerItem | unknown): item is MiniPickerPickableItem => {
+      // @ts-expect-error - will fix when we align types with minipicker: UXW-2735
+      const dbId = item?.db_id ?? item?.database_id ?? item?.dbId ?? undefined;
+
+      return Boolean(
+        // @ts-expect-error - Will be fixed once we align types with minipicker: UXW-2735
+        shouldDisableBasedOnDb({ ...item, database_id: dbId }),
+      );
+    };
+  }, [onlyDatabaseId]);
+
+  const closeOnClickOutside = !isBrowsing;
+  const [menuDropdownDom, setMenuDropdownDom] = useState<HTMLDivElement | null>(
+    null,
+  );
+  const menuDropdownRef = useCallback((node: HTMLDivElement | null) => {
+    setMenuDropdownDom(node);
+  }, []);
+
+  // Because `Menu.Target` is set to just the mention decoration node,
+  // we need to have a custom "outside" definition to not close when clicking inside the editor.
+  useClickOutside(
+    () => {
+      if (closeOnClickOutside) {
+        onClose();
+      }
+    },
+    ["mousedown", "touchstart"],
+    [editor.view.dom, menuDropdownDom],
+  );
+
   return (
-    <SuggestionPaper aria-label={t`Metabot dialog`}>
-      {isLoading ? (
-        <Group justify="center" p="sm">
-          <Loader size="sm" />
-        </Group>
-      ) : (
-        <>
-          {menuItems.map((item, index) => (
-            <MenuItemComponent
-              key={index}
-              item={item}
-              isSelected={selectedIndex === index}
-              onClick={() => selectItem(index)}
-              onMouseEnter={() => setSelectedIndex(index)}
-            />
-          ))}
-          {query.length > 0 && totalItems === 0 && !isLoading ? (
-            <Box p="sm">
-              <Text size="md" c="text-secondary" ta="center">
-                {t`No results found`}
-              </Text>
-            </Box>
-          ) : null}
-        </>
+    <>
+      <MiniPicker
+        opened
+        searchQuery={query}
+        shouldShowLibrary
+        trapFocus={isTrappingFocus}
+        models={searchModelsReal ?? []}
+        closeOnClickOutside={false}
+        onChange={onSelectEntity}
+        onClose={() => {
+          if (isTrappingFocus) {
+            setIsTrappingFocus(false);
+            editor.commands.focus();
+          } else {
+            onClose();
+          }
+        }}
+        shouldHide={shouldHide}
+        onBrowseAll={() => {
+          setIsBrowsing(true);
+        }}
+        menuDropdownRef={menuDropdownRef}
+        menuDropdownProps={{
+          onBlur: () => {
+            setIsTrappingFocus(false);
+          },
+          onFocus: () => {
+            setIsTrappingFocus(true);
+          },
+          "aria-label": t`Metabot menu`,
+        }}
+        isCompact={isCompact}
+      >
+        <ExternalMenuTarget element={decorationNode} />
+      </MiniPicker>
+      {isBrowsing && (
+        <EntityPickerModal
+          title={t`Mention an item`}
+          value={
+            onlyDatabaseId
+              ? {
+                  model: "database",
+                  id: onlyDatabaseId,
+                }
+              : undefined
+          }
+          models={searchModelsReal ?? []}
+          options={{
+            hasDatabases: true,
+            hasRootCollection: true,
+            hasPersonalCollections: true,
+            hasSearch: true,
+            hasRecents: true,
+            hasLibrary: true,
+            hasConfirmButtons: false,
+            canCreateCollections: false,
+            canCreateDashboards: false,
+          }}
+          onChange={(item) => {
+            onSelectEntity(item);
+            onClose();
+          }}
+          onClose={() => {
+            setIsBrowsing(false);
+            setIsTrappingFocus(false);
+          }}
+          isHiddenItem={shouldDisableItemNotInDb(onlyDatabaseId)}
+          searchParams={
+            onlyDatabaseId !== undefined
+              ? {
+                  table_db_id: onlyDatabaseId,
+                }
+              : undefined
+          }
+          searchQuery={query}
+        />
       )}
-    </SuggestionPaper>
+    </>
   );
 });
 
-// @deprecated only supports databases, use `MetabotMentionSuggestionNew` instead
 export const MetabotMentionSuggestion = MetabotMentionSuggestionComponent;
+
+export const createMetabotMentionSuggestion = (
+  outerProps: MetabotMentionSuggestionPropsBase,
+) => {
+  return forwardRef<BareSuggestionRendererRef, MetabotMentionSuggestionProps>(
+    function MentionSuggestionWrapper(props, ref) {
+      return <MetabotMentionSuggestion {...props} ref={ref} {...outerProps} />;
+    },
+  );
+};

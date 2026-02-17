@@ -1886,12 +1886,14 @@ const assertOnlyOneOptionActive = (
         ? H.documentMentionDialog
         : H.documentMetabotDialog;
 
+  const option = dialog === "metabot" ? "menuitem" : "option";
+
   dialogContainer()
-    .findByRole("option", { name })
+    .findByRole(option, { name })
     .should("have.attr", "aria-selected", "true");
 
   dialogContainer()
-    .findAllByRole("option")
+    .findAllByRole(option)
     .filter("[aria-selected=true]")
     .should("have.length", 1);
 };

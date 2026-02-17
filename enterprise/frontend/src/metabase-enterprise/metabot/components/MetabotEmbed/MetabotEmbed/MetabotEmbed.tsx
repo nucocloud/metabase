@@ -1,3 +1,4 @@
+import { isFulfilled } from "@reduxjs/toolkit";
 import { type JSONContent, Node, mergeAttributes } from "@tiptap/core";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { Selection } from "@tiptap/pm/state";
@@ -7,7 +8,7 @@ import {
   NodeViewWrapper,
   ReactNodeViewRenderer,
 } from "@tiptap/react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { useLatest } from "react-use";
 import { t } from "ttag";
 
@@ -18,13 +19,21 @@ import {
   generateDraftCardId,
   loadMetadataForDocumentCard,
 } from "metabase/documents/documents.slice";
-import { getCurrentDocument } from "metabase/documents/selectors";
+import {
+  getCurrentDocument,
+  getMentionsCache,
+} from "metabase/documents/selectors";
+import { getMentionsCacheKey } from "metabase/documents/utils/mentionsUtils";
 import { useDispatch, useSelector } from "metabase/lib/redux";
+import { useRegisterMetabotContextProvider } from "metabase/metabot";
 import { PLUGIN_METABOT } from "metabase/plugins";
+import { SmartLink } from "metabase/rich_text_editing/tiptap/extensions/SmartLink/SmartLinkNode";
+import { wrapCardEmbed } from "metabase/rich_text_editing/tiptap/extensions/shared/layout";
 import { Box, Button, Flex, Icon, Text, Tooltip } from "metabase/ui";
+import { AIMarkdown } from "metabase-enterprise/metabot/components/AIMarkdown";
+import { useMetabotAgent } from "metabase-enterprise/metabot/hooks";
 import type { Card, MetabotGenerateContentRequest } from "metabase-types/api";
-
-import { wrapCardEmbed } from "../shared/layout";
+import type { State } from "metabase-types/store";
 
 import S from "./MetabotEmbed.module.css";
 
@@ -33,6 +42,31 @@ declare module "@tiptap/core" {
     runMetabot: ProseMirrorNode; // the metabot node in the AST
   }
 }
+
+const getMetabotPromptSerializer =
+  (getState: () => State): PromptSerializer =>
+  (node) => {
+    const payload: ReturnType<PromptSerializer> = { instructions: "" };
+    return node.content.content.reduce((acc, child) => {
+      // Serialize @ mentions in the metabot prompt
+      if (child.type.name === SmartLink.name) {
+        const { model, entityId } = child.attrs;
+        const key = getMentionsCacheKey({ model, entityId });
+        const value = getMentionsCache(getState())[key];
+        if (!value) {
+          return acc;
+        }
+        acc.instructions += `[${value.name}](${key})`;
+        if (!acc.references) {
+          acc.references = {};
+        }
+        acc.references[key] = value.name;
+      } else {
+        acc.instructions += child.textContent;
+      }
+      return acc;
+    }, payload);
+  };
 
 const createTextNode = (text: string, marks?: JSONContent["marks"]) => {
   return { type: "text", text, marks };
@@ -45,7 +79,7 @@ const padWithUnstyledText = (content: JSONContent): JSONContent[] => [
   createTextNode(" "),
 ];
 
-export type PromptSerializer = (
+type PromptSerializer = (
   node: ProseMirrorNode,
 ) => MetabotGenerateContentRequest;
 
@@ -54,7 +88,7 @@ const serializePromptDefault: PromptSerializer = (node) => ({
 });
 
 export const MetabotNode = Node.create<{
-  serializePrompt?: PromptSerializer;
+  getState?: () => State;
 }>({
   name: "metabot",
   group: "block",
@@ -66,7 +100,7 @@ export const MetabotNode = Node.create<{
 
   addOptions() {
     return {
-      serializePrompt: serializePromptDefault,
+      getState: undefined,
     };
   },
 
@@ -144,105 +178,163 @@ export const MetabotNode = Node.create<{
   },
 });
 
+type SubmitInputResult = Awaited<
+  ReturnType<ReturnType<typeof useMetabotAgent>["submitInput"]>
+>;
+
+const getResponseChartAndQuery = (action: SubmitInputResult) => {
+  if (!isFulfilled(action)) {
+    return [];
+  }
+
+  const charts = action.payload.data?.state?.charts ?? {};
+  const queries = action.payload.data?.state?.queries ?? {};
+
+  return Object.values(charts).map((chart) => {
+    const query = queries[chart["query-id"]];
+
+    return { chart, query };
+  });
+};
+
 export const MetabotComponent = memo(
   ({ editor, getPos, deleteNode, node, extension }: NodeViewProps) => {
     const dispatch = useDispatch();
     const document = useSelector(getCurrentDocument);
-    const controllerRef = useRef<AbortController | null>(null);
-    const [isLoading, setIsLoading] = useState(false);
-    const [errorText, setErrorText] = useState("");
-    const [queryMetabot] = PLUGIN_METABOT.useLazyMetabotGenerateContentQuery();
     const isMetabotEnabled = PLUGIN_METABOT.isEnabled();
 
+    // If no chart was found, we want to present last LLM message.
+    const [noChartFoundError, setNoChartFoundError] = useState(false);
+
+    const {
+      submitInput,
+      resetConversation,
+      setProfileOverride,
+      errorMessages,
+      cancelRequest,
+      isDoingScience: isLoading,
+      messages,
+    } = useMetabotAgent("document");
+
+    const lastMessage = useMemo(() => {
+      return (
+        messages.filter((m) => m.role === "agent" && m.type === "text").at(-1)
+          ?.message ?? ""
+      );
+    }, [messages]);
+
+    useRegisterMetabotContextProvider(async () => {
+      return {
+        disabled_data_parts: ["navigate_to"],
+      };
+    });
+
     const handleRunMetabot = async () => {
-      const serializePrompt =
-        extension?.options?.serializePrompt || serializePromptDefault;
+      const serializePrompt = extension?.options?.getState
+        ? getMetabotPromptSerializer(extension.options.getState)
+        : serializePromptDefault;
       const payload = serializePrompt(node);
 
       if (!payload.instructions.trim()) {
         return;
       }
-      const controller = new AbortController();
-      controllerRef.current = controller;
-      setIsLoading(true);
-      setErrorText("");
       editor.commands.focus();
 
-      const res = queryMetabot(payload);
-      controller.signal.addEventListener("abort", () => res.abort());
-      const { data, error } = await res;
-      if (controller.signal.aborted) {
+      setNoChartFoundError(false);
+      resetConversation();
+      setProfileOverride("document");
+
+      const response = await submitInput(payload.instructions, {
+        preventOpenSidebar: true,
+      });
+
+      if (!isFulfilled(response) || !response.payload.success) {
         return;
       }
 
-      setIsLoading(false);
-
-      if (error || !data?.draft_card) {
-        setErrorText(
-          data?.error || t`There was a problem connecting to Metabot`,
-        );
+      const chartAndQuery = getResponseChartAndQuery(response);
+      if (!chartAndQuery.length) {
+        setNoChartFoundError(true);
         return;
       }
 
       const nodePosition = getPos();
 
       if (nodePosition == null) {
-        setErrorText(t`Could not find Metabot block`);
+        console.error("Could not find Metabot block");
         return;
       }
 
-      const newCardId = generateDraftCardId();
-      const card: Card = {
-        ...data.draft_card,
-        id: newCardId,
-        entity_id: "entity_id" as Card["entity_id"],
-        created_at: "",
-        updated_at: "",
-        name: data.draft_card.name || t`Exploration`,
-        description: null,
-        type: "question",
-        public_uuid: null,
-        enable_embedding: false,
-        embedding_params: null,
-        can_write: false,
-        can_restore: false,
-        can_delete: false,
-        can_manage_db: false,
-        initially_published_at: null,
-        collection_id: null,
-        collection_position: null,
-        dashboard: null,
-        dashboard_id: null,
-        dashboard_count: null,
-        result_metadata: [],
-        last_query_start: null,
-        average_query_time: null,
-        cache_ttl: null,
-        archived: false,
-      };
+      const cards = await Promise.all(
+        chartAndQuery.map(async ({ chart, query }) => {
+          const description = chart["chart-description"];
+          const newCardId = generateDraftCardId();
+          const card: Card = {
+            display: chart["chart-type"],
+            dataset_query: query,
+            database_id: query.database ?? undefined,
+            parameters: [],
+            visualization_settings: {},
+            id: newCardId,
+            entity_id: "entity_id" as Card["entity_id"],
+            created_at: "",
+            updated_at: "",
+            name: chart["chart-name"] ?? t`Exploration`,
+            description: null,
+            type: "question",
+            public_uuid: null,
+            enable_embedding: false,
+            embedding_params: null,
+            can_write: false,
+            can_restore: false,
+            can_delete: false,
+            can_manage_db: false,
+            initially_published_at: null,
+            collection_id: null,
+            collection_position: null,
+            dashboard: null,
+            dashboard_id: null,
+            dashboard_count: null,
+            result_metadata: [],
+            last_query_start: null,
+            average_query_time: null,
+            cache_ttl: null,
+            archived: false,
+          };
 
-      trackDocumentAskMetabot(document);
-      await dispatch(loadMetadataForDocumentCard(card));
+          trackDocumentAskMetabot(document);
+          await dispatch(loadMetadataForDocumentCard(card));
 
-      dispatch(
-        createDraftCard({
-          originalCard: card,
-          modifiedData: {},
-          draftId: newCardId,
+          dispatch(
+            createDraftCard({
+              originalCard: card,
+              modifiedData: {},
+              draftId: newCardId,
+            }),
+          );
+
+          return {
+            cardId: newCardId,
+            description,
+          };
         }),
       );
 
       editor.commands.insertContentAt(nodePosition, [
-        wrapCardEmbed({
-          type: "cardEmbed",
-          attrs: {
-            id: newCardId,
-          },
+        ...cards.map(({ cardId, description }) => {
+          return [
+            wrapCardEmbed({
+              type: "cardEmbed",
+              attrs: {
+                id: cardId,
+              },
+            }),
+            {
+              type: "paragraph",
+              content: [createTextNode(description)],
+            },
+          ];
         }),
-        {
-          type: "paragraph",
-          content: [createTextNode(data.description)],
-        },
         {
           type: "paragraph",
           content: padWithUnstyledText(
@@ -257,17 +349,12 @@ export const MetabotComponent = memo(
       deleteNode();
     };
 
-    const handleStopMetabot = () => {
-      controllerRef.current?.abort();
-      setIsLoading(false);
-      setErrorText("");
-    };
-
     const onRunMetabotRef = useLatest((target: ProseMirrorNode) => {
       if (target === node) {
         handleRunMetabot();
       }
     });
+
     useEffect(() => {
       const onRunMetabot = (target: ProseMirrorNode) => {
         onRunMetabotRef.current(target);
@@ -325,7 +412,7 @@ export const MetabotComponent = memo(
               hidden={!!node.content.content.length}
               contentEditable={false}
             >
-              {t`Ask Metabot to generate a chart for you, and use @ to select a specific Database to use`}
+              {t`Ask Metabot to generate a chart for you, type @ to mention items`}
             </Box>
             <NodeViewContent
               contentEditable={isLoading ? false : undefined}
@@ -343,11 +430,18 @@ export const MetabotComponent = memo(
                 >
                   {t`Working on it...`}
                 </Text>
-              ) : errorText ? (
+              ) : errorMessages.length > 0 ? (
                 <Flex gap="sm" c="text-secondary">
                   <Icon name="warning" h="1.2rem" className={S.iconShrink} />
                   <Text c="text-secondary" lh={1.4}>
-                    {errorText}
+                    {errorMessages.map((error) => error.message).join("\n")}
+                  </Text>
+                </Flex>
+              ) : noChartFoundError ? (
+                <Flex gap="sm" c="text-secondary">
+                  <Icon name="warning" h="1.2rem" className={S.iconShrink} />
+                  <Text c="text-secondary" lh={1.4}>
+                    <AIMarkdown disallowHeading>{lastMessage}</AIMarkdown>
                   </Text>
                 </Flex>
               ) : null}
@@ -362,7 +456,7 @@ export const MetabotComponent = memo(
                   size="sm"
                   disabled={!isMetabotEnabled}
                   onClick={() =>
-                    isLoading ? handleStopMetabot() : handleRunMetabot()
+                    isLoading ? cancelRequest() : handleRunMetabot()
                   }
                   classNames={{
                     label: CS.flex, // ensures icon is vertically centered
