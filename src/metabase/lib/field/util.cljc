@@ -15,7 +15,10 @@
   "Is the `column` coming directly from a card, a native query, or a previous query stage?"
   [column :- [:map
               [:lib/source {:optional true} [:maybe ::lib.schema.metadata/column.source]]]]
-  (some? (#{:source/card :source/native :source/previous-stage} (:lib/source column))))
+  (boolean (or (#{:source/card :source/native :source/previous-stage} (:lib/source column))
+               (and (:metabase.lib.join/HACK-from-incomplete-join? column)
+                    (= (:lib/source column) :source/joins)
+                    (:lib/card-id column)))))
 
 (mu/defn inherited-column-name :- [:maybe :string]
   "If the field ref for this `column` should be name-based, returns the name used in the field ref.
