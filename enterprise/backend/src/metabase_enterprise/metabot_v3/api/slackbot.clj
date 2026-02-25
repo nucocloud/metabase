@@ -827,23 +827,6 @@
           display (or (some-> (:display value) keyword) :table)]
       (slackbot.query/generate-adhoc-output query :display display))))
 
-(defn- viz-error-message
-  "Classify a visualization exception into a user-friendly message."
-  [^Exception e data-part]
-  (let [data (ex-data e)]
-    (cond
-      (:permissions-error? data)
-      "I don't have permission to access this data on your behalf."
-
-      (= "Card not found" (ex-message e))
-      "This saved question no longer exists or has been deleted."
-
-      (= "adhoc_viz" (:type data-part))
-      "Query execution failed, please try again."
-
-      :else
-      "Something went wrong while generating this visualization.")))
-
 (defn- resolve-viz-output
   "Get the result of a prefetched visualization Future, or generate synchronously if none exists.
    Unwraps ExecutionException so callers see the original error."
@@ -857,27 +840,36 @@
 
 (defn- send-visualizations
   "Send visualization data-parts as separate Slack messages after the stream ends.
-   Uses prefetched results when available (submitted during streaming) to reduce latency."
+   Uses prefetched results when available (submitted during streaming) to reduce latency.
+   Posts a temporary indicator message while visualizations are being generated."
   [client channel thread-ts data-parts prefetched-viz]
   (let [vizs (keep-indexed (fn [idx part]
                              (when (#{"static_viz" "adhoc_viz"} (:type part))
                                [idx part]))
                            data-parts)]
-    (doseq [[idx data-part] vizs]
-      (try
-        (let [output   (resolve-viz-output data-part (get prefetched-viz idx))
-              filename (case (:type data-part)
-                         "static_viz" (str "chart-" (:entity_id (:value data-part)))
-                         "adhoc_viz"  (str "adhoc-" (System/currentTimeMillis)))]
-          (send-viz-output client channel thread-ts output filename))
-        (catch Exception e
-          (log/errorf e "Failed to generate visualization for %s" (:type data-part))
-          (try
-            (post-message client {:channel   channel
-                                  :thread_ts thread-ts
-                                  :text      (viz-error-message e data-part)})
-            (catch Exception post-e
-              (log/error post-e "Failed to post visualization error message to Slack"))))))))
+    (when (seq vizs)
+      (let [indicator (post-message client {:channel   channel
+                                            :thread_ts thread-ts
+                                            :text      "_Generating visualizations..._"})]
+        (try
+          (doseq [[idx data-part] vizs]
+            (try
+              (let [output   (resolve-viz-output data-part (get prefetched-viz idx))
+                    filename (case (:type data-part)
+                               "static_viz" (str "chart-" (:entity_id (:value data-part)))
+                               "adhoc_viz"  (str "adhoc-" (System/currentTimeMillis)))]
+                (send-viz-output client channel thread-ts output filename))
+              (catch Exception e
+                (log/errorf e "Failed to generate visualization for %s" (:type data-part))
+                (try
+                  (post-message client {:channel   channel
+                                        :thread_ts thread-ts
+                                        :text      "Something went wrong while generating this visualization."})
+                  (catch Exception post-e
+                    (log/error post-e "Failed to post visualization error message to Slack"))))))
+          (finally
+            (when-let [ts (:ts indicator)]
+              (delete-message client {:channel channel :ts ts}))))))))
 
 (defn- make-streaming-callbacks
   "Create streaming callback functions and associated control functions.
@@ -1058,6 +1050,7 @@
              (send-visualizations client channel thread-ts data-parts @prefetched-viz))
            (post-message client (merge message-ctx {:text "I wasn't able to generate a response. Please try again."}))))
        (catch Exception e
+         (run! #(.cancel ^Future % true) (vals @prefetched-viz))
          (log/error e "[slackbot] Error in streaming response")
          (await slack-writer)
          (if-let [{:keys [stream_ts channel]} @stream-state]
