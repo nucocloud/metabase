@@ -137,6 +137,9 @@
             :or   {display :table}}]
   (let [display (keyword display)
         results (execute-adhoc-query query)]
+    (when (= :failed (:status results))
+      (throw (ex-info (or (:error results) "Query execution failed")
+                      (select-keys results [:error :status]))))
     (if (contains? chart-display-types display)
       {:type    :image
        :content (generate-adhoc-png results display)}
