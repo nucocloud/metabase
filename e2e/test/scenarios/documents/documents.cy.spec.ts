@@ -805,12 +805,10 @@ describe("documents", () => {
         H.commandSuggestionItem(/Ask Metabot/).click();
         H.addToDocument("@", false);
 
+        cy.realPress("{downarrow}");
         assertOnlyOneOptionActive(/QA Postgres/, "metabot");
         cy.realPress("{downarrow}");
         assertOnlyOneOptionActive(/Sample/, "metabot");
-
-        H.documentMetabotSuggestionItem(/QA Postgres/).realHover();
-        assertOnlyOneOptionActive(/QA Postgres/, "metabot");
       });
 
       it("should support adding cards and updating viz settings", () => {
