@@ -955,34 +955,29 @@
                     (when (>= (count @pending-text) min-text-batch-size)
                       (request-flush!))))
 
+        send-task-update! (fn [id tool-name status]
+                            (when-let [{:keys [stream_ts channel]} @stream-state]
+                              (send-via slack-writer-executor slack-writer
+                                        (fn [_]
+                                          (drain-pending-text!)
+                                          (when (= status "in_progress")
+                                            (dismiss-thinking!))
+                                          (append-stream client channel stream_ts
+                                                         [{:type   "task_update"
+                                                           :id     id
+                                                           :title  (tool-name->friendly tool-name)
+                                                           :status status}])
+                                          (when (= status "complete")
+                                            (append-markdown-text client channel stream_ts "\n"))
+                                          nil))))
+
         on-tool-start (fn [{:keys [id tool-name]}]
                         (request-flush!)
                         (vswap! tool-id->name assoc id tool-name)
-                        (when-let [{:keys [stream_ts channel]} @stream-state]
-                          (send-via slack-writer-executor slack-writer
-                                    (fn [_]
-                                      (drain-pending-text!)
-                                      (dismiss-thinking!)
-                                      (append-stream client channel stream_ts
-                                                     [{:type   "task_update"
-                                                       :id     id
-                                                       :title  (tool-name->friendly tool-name)
-                                                       :status "in_progress"}])
-                                      nil))))
+                        (send-task-update! id tool-name "in_progress"))
 
         on-tool-end (fn [{:keys [id]}]
-                      (when-let [{:keys [stream_ts channel]} @stream-state]
-                        (let [tool-name (get @tool-id->name id)]
-                          (send-via slack-writer-executor slack-writer
-                                    (fn [_]
-                                      (drain-pending-text!)
-                                      (append-stream client channel stream_ts
-                                                     [{:type   "task_update"
-                                                       :id     id
-                                                       :title  (tool-name->friendly tool-name)
-                                                       :status "complete"}])
-                                      (append-markdown-text client channel stream_ts "\n")
-                                      nil))))
+                      (send-task-update! id (get @tool-id->name id) "complete")
                       (vswap! tool-id->name dissoc id))
 
         ;; Prefetch visualization generation. When a DATA part arrives mid-stream, submit
@@ -1178,6 +1173,16 @@
   (and (app-mention? event)
        (seq (:files event))))
 
+(defn- process-event-async!
+  "Process a Slack event asynchronously, logging and catching errors."
+  [event-type process-fn client event]
+  (log/debugf "[slackbot] Processing %s event" event-type)
+  (future
+    (try
+      (process-fn client event)
+      (catch Exception e
+        (log/errorf e "[slackbot] Error processing %s: %s" event-type (ex-message e))))))
+
 (mu/defn- handle-event-callback :- SlackEventsResponse
   "Respond to an event_callback request"
   [payload :- SlackEventCallbackEvent]
@@ -1197,22 +1202,10 @@
                     (:ts event))
 
         (app-mention? event)
-        (do
-          (log/debug "[slackbot] Processing app_mention event")
-          (future
-            (try
-              (process-app-mention client event)
-              (catch Exception e
-                (log/errorf e "[slackbot] Error processing app_mention: %s" (ex-message e))))))
+        (process-event-async! "app_mention" process-app-mention client event)
 
         (known-user-message? event)
-        (do
-          (log/debug "[slackbot] Processing user message event")
-          (future
-            (try
-              (process-user-message client event)
-              (catch Exception e
-                (log/errorf e "[slackbot] Error processing message: %s" (ex-message e))))))
+        (process-event-async! "user message" process-user-message client event)
 
         :else
         (log/debugf "[slackbot] Ignoring unhandled event type: %s" (:type event)))))
